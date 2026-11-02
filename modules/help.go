@@ -30,33 +30,15 @@ func NewHelpModule(sender *telegram.MessageSender, userMap *types.SafeUserMap, s
 	}
 }
 
-func (m *HelpModule) getStartText(name string) string {
-	if name == "" {
-		name = "Master"
-	}
-	return fmt.Sprintf("<blockquote>%s, <b>%s</b></blockquote>\n\n"+
-		"<blockquote>%s</blockquote>\n\n"+
-		"<blockquote>❝ <b>%s</b> ❞\n\n"+
-		"― %s</blockquote>",
-		telegram.ToSmallCaps("Hey"),
-		name,
-		telegram.ToSmallCaps("I'm an AZML-Go Leech with Auto Rename Bot, built with love."),
-		telegram.ToSmallCaps("Winning is everything. As long as I win in the end, that's all that matters."),
-		telegram.ToSmallCaps("Love From Go"))
+func (m *HelpModule) getStartText() string {
+	return "<i>This bot downloads and leeches direct links, torrents, and Telegram files straight back to Telegram.</i>\n\n" +
+		"<i>Type /help to see the available commands.</i>"
 }
 
-func (m *HelpModule) getStartButtons(ownerID int64) *telegram.ButtonMaker {
-	cfg := config.Get()
+func (m *HelpModule) getStartButtons() *telegram.ButtonMaker {
 	btn := telegram.NewButtonMaker()
 	btn.IButtonStyled("◈ "+telegram.ToSmallCaps("Help Guide"), "start_help", "primary")
-
-	ownerUsername := strings.TrimPrefix(strings.TrimSpace(cfg.OwnerUsername), "@")
-	if ownerUsername == "" {
-		ownerUsername = "exe_aquib"
-	}
-	ownerURL := fmt.Sprintf("https://t.me/%s", ownerUsername)
-
-	btn.UButtonStyled("◈ "+telegram.ToSmallCaps("Owner"), ownerURL, "primary")
+	btn.UButtonStyled("◈ "+telegram.ToSmallCaps("Repo"), "https://github.com/obscure-n8/azml-X-ZxZone", "primary")
 	btn.Row()
 	return btn
 }
@@ -101,19 +83,8 @@ func (m *HelpModule) HandleStart(ctx context.Context, peer tg.InputPeerClass, ms
 		}
 	}
 
-	cfg := config.Get()
-	startText := m.getStartText(msg.SenderName)
-	startBtns := m.getStartButtons(cfg.OwnerID)
-
-	cover := cfg.CoverImage
-	if cover != "" && (strings.HasPrefix(cover, "http://") || strings.HasPrefix(cover, "https://")) {
-		_, err := m.sender.SendPhotoFromURLWithButtons(ctx, peer, cover, startText, msg.MessageID, startBtns, 2)
-		if err == nil {
-			return
-		}
-	}
-
-	_, _ = m.sender.SendMessageWithButtons(ctx, peer, startText, msg.MessageID, startBtns, 2)
+	startText := m.getStartText()
+	_, _ = m.sender.SendMessageWithButtons(ctx, peer, startText, msg.MessageID, m.getStartButtons(), 2)
 }
 
 func (m *HelpModule) HandleHelp(ctx context.Context, peer tg.InputPeerClass, msg *types.MessageContext) {
@@ -182,14 +153,7 @@ func (m *HelpModule) HandleStatsCallback(ctx context.Context, peer tg.InputPeerC
 		return
 	}
 	if data == "start_back" {
-		cfg := config.Get()
-		name := "Master"
-		if u := m.userMap.Get(fromUID); u != nil && u.Name != "" {
-			name = u.Name
-		}
-		startText := m.getStartText(name)
-		startBtns := m.getStartButtons(cfg.OwnerID)
-		_ = m.sender.EditMessageWithButtons(ctx, peer, msgID, startText, startBtns, 2)
+		_ = m.sender.EditMessageWithButtons(ctx, peer, msgID, m.getStartText(), m.getStartButtons(), 2)
 		_ = m.sender.AnswerCallback(ctx, queryID, "", false)
 		return
 	}
