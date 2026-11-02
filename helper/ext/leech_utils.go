@@ -447,26 +447,49 @@ func SplitFile(filePath string, maxSplitSize int64, outDir string, equalSplits b
 	if splitSize <= 0 {
 		splitSize = maxSplitSize
 	}
+	binarySplitSize := splitSize
+	videoSplitSize := splitSize
 
 	partsCount := int((fileSize + maxSplitSize - 1) / maxSplitSize)
-	if equalSplits && partsCount > 1 {
-		splitSize = (fileSize+int64(partsCount)-1)/int64(partsCount) + 1024
-	}
 
 	extName := strings.ToLower(filepath.Ext(filePath))
 	details, probeErr := ProbeMedia(filePath)
 	if probeErr == nil && details.Duration > 5 && isVideoExtension(extName) {
-		parts, vErr := splitVideo(filePath, fileSize, splitSize, details.Duration, outDir, partsCount, equalSplits)
-		if vErr == nil && len(parts) > 1 {
-			return parts, nil
-		}
-		// If video split failed, clean up any partial files and fallback to binary split
-		for _, p := range parts {
-			_ = os.Remove(p)
+		for attempt := 0; attempt < 4; attempt++ {
+			parts, vErr := splitVideo(filePath, fileSize, videoSplitSize, details.Duration, outDir, partsCount, equalSplits)
+			if vErr == nil && len(parts) > 1 && splitPartsWithinLimit(parts, maxSplitSize) {
+				return parts, nil
+			}
+			for _, p := range parts {
+				_ = os.Remove(p)
+			}
+			if equalSplits {
+				partsCount++
+			} else {
+				reduction := int64(16 * 1024 * 1024)
+				if videoSplitSize/2 < reduction {
+					reduction = videoSplitSize / 2
+				}
+				videoSplitSize -= reduction
+				if videoSplitSize <= 0 {
+					break
+				}
+				partsCount = int((fileSize + videoSplitSize - 1) / videoSplitSize)
+			}
 		}
 	}
 
-	return splitBinary(filePath, splitSize, outDir)
+	return splitBinary(filePath, binarySplitSize, outDir)
+}
+
+func splitPartsWithinLimit(parts []string, maxSize int64) bool {
+	for _, part := range parts {
+		fi, err := os.Stat(part)
+		if err != nil || fi.Size() > maxSize {
+			return false
+		}
+	}
+	return true
 }
 
 func splitVideo(filePath string, totalSize int64, splitSize int64, duration int, outDir string, expectedParts int, equalSplits bool) ([]string, error) {
@@ -480,11 +503,15 @@ func splitVideo(filePath string, totalSize int64, splitSize int64, duration int,
 		for i := 0; i < expectedParts; i++ {
 			partPath := filepath.Join(outDir, fmt.Sprintf("%s.part%03d%s", base, i+1, ext))
 			start := i * partDuration
+			currentDuration := partDuration
+			if i == expectedParts-1 {
+				currentDuration = duration - start
+			}
 			cmd := exec.Command("ffmpeg",
 				"-hide_banner", "-loglevel", "error",
 				"-ss", strconv.Itoa(start),
 				"-i", filePath,
-				"-t", strconv.Itoa(partDuration),
+				"-t", strconv.Itoa(currentDuration),
 				"-map", "0",
 				"-c", "copy",
 				partPath, "-y",

@@ -33,6 +33,28 @@ func TestGetReadableFileSize(t *testing.T) {
 	}
 }
 
+func TestSplitPartsWithinLimit(t *testing.T) {
+	dir := t.TempDir()
+	withinLimit := filepath.Join(dir, "within.bin")
+	overLimit := filepath.Join(dir, "over.bin")
+	if err := os.WriteFile(withinLimit, make([]byte, 1024), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(overLimit, make([]byte, 1025), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	if !splitPartsWithinLimit([]string{withinLimit}, 1024) {
+		t.Fatal("expected a part at the size limit to be accepted")
+	}
+	if splitPartsWithinLimit([]string{overLimit}, 1024) {
+		t.Fatal("expected a part over the size limit to be rejected")
+	}
+	if splitPartsWithinLimit([]string{filepath.Join(dir, "missing.bin")}, 1024) {
+		t.Fatal("expected a missing part to be rejected")
+	}
+}
+
 func TestGetReadableTime(t *testing.T) {
 	tests := []struct {
 		name     string
