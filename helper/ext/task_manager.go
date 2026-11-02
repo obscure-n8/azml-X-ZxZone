@@ -173,16 +173,16 @@ func (m *TaskManager) BuildStatusMessage(page int) (string, *telegram.ButtonMake
 		mem := GetMemoryStats()
 		uptime := TimeSinceFormatted(BotStartTime)
 		noTaskMsg := fmt.Sprintf("<i>%s</i>\n\n"+
-			"⌬ <b>%s</b>\n"+
+			"⌬ <b><i>%s</i></b>\n"+
 			"<blockquote>╭ <b>Active Tasks:</b> 0\n"+
 			"┠ <b>Ram:</b> %.1f%% | <b>Cpu:</b> %.1f%%\n"+
 			"┠ <b>Uptime:</b> %s\n"+
 			"╰ <b>Disk Free:</b> %s</blockquote>",
 			telegram.ToSmallCaps("No Active Tasks Running!"),
-			telegram.ToSmallCaps("Bot Stats"),
+			"Bot Stats",
 			mem.OSPercent, GetCPUPercent(), uptime, mem.OSFree)
 		btn := telegram.NewButtonMaker()
-		btn.IButtonStyled("⌬ "+telegram.ToSmallCaps("Refresh"), "status ref 1", "primary")
+		btn.IButtonStyled("⟳ "+telegram.ToSmallCaps("Refresh"), "status ref 1", "primary")
 		btn.Row()
 		return noTaskMsg, btn
 	}
@@ -254,6 +254,7 @@ func (m *TaskManager) BuildStatusMessage(page int) (string, *telegram.ButtonMake
 		sb.WriteString(fmt.Sprintf("╭ [%s] <i>%.1f%%</i>\n", bar, pct))
 		sb.WriteString(fmt.Sprintf("┠ <b>Status:</b> <i>%s...</i>\n", telegram.EscapeHTML(string(t.Status()))))
 		sb.WriteString(fmt.Sprintf("┠ <b>Done:</b> %s\n", GetReadableFileSize(t.DownloadedBytes())))
+		sb.WriteString(fmt.Sprintf("┠ <b>Total:</b> %s\n", GetReadableFileSize(t.Size())))
 		sb.WriteString(fmt.Sprintf("┠ <b>Eta:</b> %s\n", telegram.EscapeHTML(t.ETA())))
 		sb.WriteString(fmt.Sprintf("┠ <b>Elapsed:</b> %s\n", telegram.EscapeHTML(elapsed)))
 		sb.WriteString(fmt.Sprintf("┠ <b>Speed:</b> %s/s\n", GetReadableFileSize(int64(t.Speed()))))
@@ -267,7 +268,7 @@ func (m *TaskManager) BuildStatusMessage(page int) (string, *telegram.ButtonMake
 	mem := GetMemoryStats()
 	uptime := TimeSinceFormatted(BotStartTime)
 
-	sb.WriteString(fmt.Sprintf("⌬ <b>%s</b>\n", telegram.ToSmallCaps("Bot Stats")))
+	sb.WriteString("⌬ <b><i>Bot Stats</i></b>\n")
 	sb.WriteString(fmt.Sprintf("<blockquote>╭ <b>Active Tasks:</b> %d\n", totalTasks))
 	sb.WriteString(fmt.Sprintf("┠ <b>Ram:</b> %.1f%% | <b>Cpu:</b> %.1f%%\n", mem.OSPercent, GetCPUPercent()))
 	sb.WriteString(fmt.Sprintf("┠ <b>Uptime:</b> %s\n", uptime))
@@ -291,7 +292,7 @@ func (m *TaskManager) BuildStatusMessage(page int) (string, *telegram.ButtonMake
 		btn.IButtonStyled("⫸", fmt.Sprintf("status page %d", nextPage), "primary")
 		btn.Row()
 	} else {
-		btn.IButtonStyled("⌬ "+telegram.ToSmallCaps("Refresh"), fmt.Sprintf("status ref %d", page), "primary")
+		btn.IButtonStyled("⟳ "+telegram.ToSmallCaps("Refresh"), fmt.Sprintf("status ref %d", page), "primary")
 		btn.Row()
 	}
 
