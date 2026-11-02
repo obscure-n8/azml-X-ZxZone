@@ -154,6 +154,7 @@ func (m *YtdlModule) processYtdl(peer tg.InputPeerClass, msg *types.MessageConte
 
 	taskUID := fmt.Sprintf("yt_%d_%s", msg.UserID, ext.RandomHex(3))
 	uTask := ext.NewUnifiedTask(taskUID, "yt-dlp Media", 0, msg.ChatID, msg.UserID, notifyID, cancel)
+	uTask.SetStatusDisplay(msg.Username, msg.SenderName, "#ytdl")
 	uTask.SetEngine("yt-dlp")
 	m.taskMgr.AddTask(uTask)
 

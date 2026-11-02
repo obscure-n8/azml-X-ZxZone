@@ -345,6 +345,10 @@ func getCPUPercent() float64 {
 	return lastCPUCalc
 }
 
+func GetCPUPercent() float64 {
+	return getCPUPercent()
+}
+
 // RenderSysStats produces the exact Python SYS_STATS theme output
 func RenderSysStats() string {
 	// OS Uptime

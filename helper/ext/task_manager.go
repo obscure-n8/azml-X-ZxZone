@@ -173,15 +173,14 @@ func (m *TaskManager) BuildStatusMessage(page int) (string, *telegram.ButtonMake
 		mem := GetMemoryStats()
 		uptime := TimeSinceFormatted(BotStartTime)
 		noTaskMsg := fmt.Sprintf("<i>%s</i>\n\n"+
-			"⌬ <b><u>%s</u></b>\n"+
-			"┠ <b>%s:</b> <code>%.1f%%</code> | <b>%s:</b> <code>%.1f MB</code>\n"+
-			"┠ <b>%s:</b> <code>%s</code>\n"+
-			"┖ <b>%s:</b> <code>%s</code>",
+			"⌬ <b>%s</b>\n"+
+			"<blockquote>╭ <b>Active Tasks:</b> 0\n"+
+			"┠ <b>Ram:</b> %.1f%% | <b>Cpu:</b> %.1f%%\n"+
+			"┠ <b>Uptime:</b> %s\n"+
+			"╰ <b>Disk Free:</b> %s</blockquote>",
 			telegram.ToSmallCaps("No Active Tasks Running!"),
 			telegram.ToSmallCaps("Bot Stats"),
-			telegram.ToSmallCaps("System RAM"), mem.OSPercent, telegram.ToSmallCaps("App RAM"), mem.AppRAMMB,
-			telegram.ToSmallCaps("Disk Free"), mem.OSFree,
-			telegram.ToSmallCaps("Uptime"), uptime)
+			mem.OSPercent, GetCPUPercent(), uptime, mem.OSFree)
 		btn := telegram.NewButtonMaker()
 		btn.IButtonStyled("⌬ "+telegram.ToSmallCaps("Refresh"), "status ref 1", "primary")
 		btn.Row()
@@ -231,29 +230,48 @@ func (m *TaskManager) BuildStatusMessage(page int) (string, *telegram.ButtonMake
 		pct := t.Progress()
 		bar := makeProgressBar(pct)
 		elapsed := TimeSinceFormatted(t.StartTime())
-
-		sb.WriteString(fmt.Sprintf("◈ <b>%s</b>\n", SanitizeFilename(t.Name())))
-		sb.WriteString(fmt.Sprintf("┃ [%s] <code>%.1f%%</code>\n", bar, pct))
-		sb.WriteString(fmt.Sprintf("┠ <b>%s:</b> <code>%s</code> / <code>%s</code>\n", telegram.ToSmallCaps("Processed"), GetReadableFileSize(t.DownloadedBytes()), GetReadableFileSize(t.Size())))
-		sb.WriteString(fmt.Sprintf("┠ <b>%s:</b> <i>%s</i> | <b>%s:</b> <code>%s</code>\n", telegram.ToSmallCaps("Status"), t.Status(), telegram.ToSmallCaps("ETA"), t.ETA()))
-		sb.WriteString(fmt.Sprintf("┠ <b>%s:</b> <code>%s/s</code> | <b>%s:</b> <code>%s</code>\n", telegram.ToSmallCaps("Speed"), GetReadableFileSize(int64(t.Speed())), telegram.ToSmallCaps("Elapsed"), elapsed))
-		sb.WriteString(fmt.Sprintf("┠ <b>%s:</b> <code>%s</code>\n", telegram.ToSmallCaps("Engine"), t.Engine()))
-		uID := t.UserID()
-		if uID == 0 {
-			uID = cfg.OwnerID
+		user := fmt.Sprintf("User %d", t.UserID())
+		inMode := "#leech"
+		if displayTask, ok := t.(interface {
+			StatusUsername() string
+			StatusSenderName() string
+			StatusInputMode() string
+		}); ok {
+			if username := strings.TrimSpace(displayTask.StatusUsername()); username != "" {
+				user = "@" + strings.TrimPrefix(username, "@")
+			} else if name := strings.TrimSpace(displayTask.StatusSenderName()); name != "" {
+				user = name
+			}
+			if mode := strings.TrimSpace(displayTask.StatusInputMode()); mode != "" {
+				inMode = mode
+			}
+		} else if strings.HasPrefix(t.GID(), "yt_") {
+			inMode = "#ytdl"
 		}
-		sb.WriteString(fmt.Sprintf("┠ <b>%s:</b> <code>%d</code>\n", telegram.ToSmallCaps("User ID"), uID))
-		sb.WriteString(fmt.Sprintf("┖ /cancel_%s\n\n", t.GID()))
+		engine := strings.SplitN(t.Engine(), " [", 2)[0]
+
+		sb.WriteString(fmt.Sprintf("<b>%d. Task Name:</b> %s\n", i+1, telegram.EscapeHTML(SanitizeFilename(t.Name()))))
+		sb.WriteString(fmt.Sprintf("╭ [%s] <i>%.1f%%</i>\n", bar, pct))
+		sb.WriteString(fmt.Sprintf("┠ <b>Status:</b> <i>%s...</i>\n", telegram.EscapeHTML(string(t.Status()))))
+		sb.WriteString(fmt.Sprintf("┠ <b>Done:</b> %s\n", GetReadableFileSize(t.DownloadedBytes())))
+		sb.WriteString(fmt.Sprintf("┠ <b>Eta:</b> %s\n", telegram.EscapeHTML(t.ETA())))
+		sb.WriteString(fmt.Sprintf("┠ <b>Elapsed:</b> %s\n", telegram.EscapeHTML(elapsed)))
+		sb.WriteString(fmt.Sprintf("┠ <b>Speed:</b> %s/s\n", GetReadableFileSize(int64(t.Speed()))))
+		sb.WriteString(fmt.Sprintf("┠ <b>Engine:</b> %s\n", telegram.EscapeHTML(engine)))
+		sb.WriteString(fmt.Sprintf("┠ <b>User:</b> %s\n", telegram.EscapeHTML(user)))
+		sb.WriteString(fmt.Sprintf("┠ <b>In Mode:</b> %s\n", telegram.EscapeHTML(inMode)))
+		sb.WriteString("┠ <b>Out Mode:</b> telegram\n")
+		sb.WriteString(fmt.Sprintf("╰ /cancel_%s\n\n", telegram.EscapeHTML(t.GID())))
 	}
 
 	mem := GetMemoryStats()
 	uptime := TimeSinceFormatted(BotStartTime)
 
-	sb.WriteString(fmt.Sprintf("⌬ <b><u>%s</u></b>\n", telegram.ToSmallCaps("Bot Status")))
-	sb.WriteString(fmt.Sprintf("┠ <b>%s:</b> <code>%d</code>\n", telegram.ToSmallCaps("Active Tasks"), totalTasks))
-	sb.WriteString(fmt.Sprintf("┠ <b>%s:</b> <code>%.1f%%</code> | <b>%s:</b> <code>%.1f MB</code>\n", telegram.ToSmallCaps("System RAM"), mem.OSPercent, telegram.ToSmallCaps("App RAM"), mem.AppRAMMB))
-	sb.WriteString(fmt.Sprintf("┠ <b>%s:</b> <code>%s</code>\n", telegram.ToSmallCaps("Uptime"), uptime))
-	sb.WriteString(fmt.Sprintf("┖ <b>%s:</b> <code>%s/s</code> | <b>%s:</b> <code>%s/s</code>", telegram.ToSmallCaps("DL Speed"), GetReadableFileSize(int64(totalDL)), telegram.ToSmallCaps("UL Speed"), GetReadableFileSize(int64(totalUL))))
+	sb.WriteString(fmt.Sprintf("⌬ <b>%s</b>\n", telegram.ToSmallCaps("Bot Stats")))
+	sb.WriteString(fmt.Sprintf("<blockquote>╭ <b>Active Tasks:</b> %d\n", totalTasks))
+	sb.WriteString(fmt.Sprintf("┠ <b>Ram:</b> %.1f%% | <b>Cpu:</b> %.1f%%\n", mem.OSPercent, GetCPUPercent()))
+	sb.WriteString(fmt.Sprintf("┠ <b>Uptime:</b> %s\n", uptime))
+	sb.WriteString(fmt.Sprintf("╰ <b>DL:</b> %s/s | <b>Ul:</b> %s/s</blockquote>", GetReadableFileSize(int64(totalDL)), GetReadableFileSize(int64(totalUL))))
 
 	btn := telegram.NewButtonMaker()
 
@@ -287,24 +305,19 @@ func makeProgressBar(pct float64) string {
 	if pct > 100 {
 		pct = 100
 	}
-	totalBlocks := 12
-	cFull := int(pct / (100.0 / float64(totalBlocks)))
-	if cFull > totalBlocks {
-		cFull = totalBlocks
-	}
+	const totalBlocks = 12
+	cFull := int(pct * totalBlocks / 100)
+	remainder := pct*totalBlocks/100 - float64(cFull)
 	var sb strings.Builder
 	for i := 0; i < cFull; i++ {
-		sb.WriteString("■")
+		sb.WriteString("⬤")
 	}
-	remainder := pct - float64(cFull)*(100.0/float64(totalBlocks))
-	parts := []string{"▤", "▥", "▦", "▧", "▨", "▩"}
-	partIdx := int((remainder / (100.0 / float64(totalBlocks))) * float64(len(parts)))
-	if cFull < totalBlocks && partIdx >= 0 && partIdx < len(parts) && remainder > 0.5 {
-		sb.WriteString(parts[partIdx])
+	if cFull < totalBlocks && remainder >= 0.5 {
+		sb.WriteString("◔")
 		cFull++
 	}
 	for i := cFull; i < totalBlocks; i++ {
-		sb.WriteString("□")
+		sb.WriteString("○")
 	}
 	return sb.String()
 }
@@ -369,6 +382,9 @@ func (q *QueueTask) Cancel() error {
 type UnifiedTask struct {
 	gid        string
 	name       string
+	username   string
+	senderName string
+	inputMode  string
 	size       int64
 	downloaded int64
 	speed      float64
@@ -405,6 +421,28 @@ func NewUnifiedTask(gid, name string, size int64, chatID, userID int64, msgID in
 }
 
 func (u *UnifiedTask) GID() string { return u.gid }
+func (u *UnifiedTask) StatusUsername() string {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.username
+}
+func (u *UnifiedTask) StatusSenderName() string {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.senderName
+}
+func (u *UnifiedTask) StatusInputMode() string {
+	u.mu.RLock()
+	defer u.mu.RUnlock()
+	return u.inputMode
+}
+func (u *UnifiedTask) SetStatusDisplay(username, senderName, inputMode string) {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	u.username = username
+	u.senderName = senderName
+	u.inputMode = inputMode
+}
 func (u *UnifiedTask) Name() string {
 	u.mu.RLock()
 	defer u.mu.RUnlock()

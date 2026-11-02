@@ -390,6 +390,7 @@ func (m *LeechModule) processLeechPipeline(peer tg.InputPeerClass, msg *types.Me
 	displayName = filepath.Base(displayName)
 
 	uTask := ext.NewUnifiedTask(taskUID, displayName, msg.FileSize, msg.ChatID, msg.UserID, notifyID, cancel)
+	uTask.SetStatusDisplay(msg.Username, msg.SenderName, "#leech")
 	m.taskMgr.AddTask(uTask)
 
 	// Instantly render the status progress bar so the user gets an immediate (<1s) response
