@@ -438,26 +438,30 @@ func SplitFile(filePath string, maxSplitSize int64, outDir string, equalSplits b
 		return nil, err
 	}
 	fileSize := fi.Size()
-	if fileSize <= maxSplitSize {
+	safeMaxSize := maxSplitSize - 32*1024*1024
+	if safeMaxSize <= 0 {
+		safeMaxSize = maxSplitSize
+	}
+	if fileSize <= safeMaxSize {
 		return []string{filePath}, nil
 	}
 
 	// Safety margin of 5MB so Telegram never rejects with FILE_TOO_BIG (under 2GB / 4GB)
-	splitSize := maxSplitSize - (5 * 1024 * 1024)
+	splitSize := safeMaxSize - (5 * 1024 * 1024)
 	if splitSize <= 0 {
-		splitSize = maxSplitSize
+		splitSize = safeMaxSize
 	}
 	binarySplitSize := splitSize
 	videoSplitSize := splitSize
 
-	partsCount := int((fileSize + maxSplitSize - 1) / maxSplitSize)
+	partsCount := int((fileSize + safeMaxSize - 1) / safeMaxSize)
 
 	extName := strings.ToLower(filepath.Ext(filePath))
 	details, probeErr := ProbeMedia(filePath)
 	if probeErr == nil && details.Duration > 5 && isVideoExtension(extName) {
 		for attempt := 0; attempt < 4; attempt++ {
 			parts, vErr := splitVideo(filePath, fileSize, videoSplitSize, details.Duration, outDir, partsCount, equalSplits)
-			if vErr == nil && len(parts) > 1 && splitPartsWithinLimit(parts, maxSplitSize) {
+			if vErr == nil && len(parts) > 1 && splitPartsWithinLimit(parts, safeMaxSize) {
 				return parts, nil
 			}
 			for _, p := range parts {
