@@ -1,0 +1,26 @@
+# Binaries
+azml-go
+azml-go-*
+azml-go.exe
+*.exe
+
+# Testing & Coverage
+coverage.*
+*.out
+
+# Configuration & sensitive credentials
+config.env
+.env
+*.env
+token.pickle
+accounts.zip
+cookies.txt
+shorteners.txt
+terabox.txt
+.netrc
+
+# Runtime data & logs
+user_data.json
+downloads/
+Thumbnails/
+*.log

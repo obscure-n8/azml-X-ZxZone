@@ -1,0 +1,1280 @@
+package uploader
+
+import (
+	"bytes"
+	"context"
+	cryptoRand "crypto/rand"
+	"encoding/binary"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"log"
+	"math/rand"
+	"net"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strconv"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"time"
+
+	"azml-go/config"
+	"azml-go/helper/ext"
+	"azml-go/helper/pool"
+	"azml-go/helper/telegram"
+	"azml-go/types"
+
+	"github.com/gotd/td/telegram/uploader"
+	"github.com/gotd/td/tg"
+	"github.com/gotd/td/tgerr"
+)
+
+var botAPICopyClient = &http.Client{Timeout: 15 * time.Second}
+
+func randID() int64 {
+	var b [8]byte
+	_, _ = cryptoRand.Read(b[:])
+	return int64(binary.LittleEndian.Uint64(b[:]))
+}
+
+func copyMessageViaBotAPI(botToken string, toChatID int64, fromChatID int64, msgID int) bool {
+	if botToken == "" || toChatID == 0 || fromChatID == 0 || msgID <= 0 {
+		return false
+	}
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/copyMessage", botToken)
+	payload := map[string]interface{}{
+		"chat_id":      toChatID,
+		"from_chat_id": fromChatID,
+		"message_id":   msgID,
+	}
+	body, _ := json.Marshal(payload)
+	resp, err := botAPICopyClient.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		log.Printf("[AZML-Go Uploader] copyMessage HTTP error to %d: %v", toChatID, err)
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var res struct {
+		Ok          bool   `json:"ok"`
+		Description string `json:"description"`
+	}
+	if json.NewDecoder(resp.Body).Decode(&res) == nil && res.Ok {
+		log.Printf("[AZML-Go Uploader] copyMessage succeeded to %d without forward tag!", toChatID)
+		return true
+	}
+	log.Printf("[AZML-Go Uploader] copyMessage failed to %d: %s", toChatID, res.Description)
+	return false
+}
+
+func deleteMessageViaBotAPI(botToken string, chatID int64, msgID int) bool {
+	if botToken == "" || chatID == 0 || msgID <= 0 {
+		return false
+	}
+	url := fmt.Sprintf("https://api.telegram.org/bot%s/deleteMessage", botToken)
+	payload := map[string]interface{}{
+		"chat_id":    chatID,
+		"message_id": msgID,
+	}
+	body, _ := json.Marshal(payload)
+	resp, err := botAPICopyClient.Post(url, "application/json", bytes.NewReader(body))
+	if err != nil {
+		return false
+	}
+	defer func() { _ = resp.Body.Close() }()
+	var res struct {
+		Ok bool `json:"ok"`
+	}
+	return json.NewDecoder(resp.Body).Decode(&res) == nil && res.Ok
+}
+
+type TelegramUploader struct {
+	botClient   *tg.Client
+	botUp       *uploader.Uploader
+	userClient  *tg.Client
+	userClients []*tg.Client
+	userUp      *uploader.Uploader
+	sessPool    *pool.SessionPool
+	dumpChatID  int64
+}
+
+func NewTelegramUploader(botClient *tg.Client, userClient *tg.Client) *TelegramUploader {
+	botUp := uploader.NewUploader(botClient).WithPartSize(512 * 1024).WithThreads(8)
+	var userUp *uploader.Uploader
+	var userClients []*tg.Client
+	if userClient != nil {
+		userClients = []*tg.Client{userClient}
+		userUp = uploader.NewUploader(userClient).WithPartSize(512 * 1024).WithThreads(16)
+	}
+	return &TelegramUploader{
+		botClient:   botClient,
+		botUp:       botUp,
+		userClient:  userClient,
+		userClients: userClients,
+		userUp:      userUp,
+	}
+}
+
+func (u *TelegramUploader) SetSessionPool(sessPool *pool.SessionPool, dumpChatID int64) {
+	u.sessPool = sessPool
+	u.dumpChatID = dumpChatID
+}
+
+func (u *TelegramUploader) SetUserClient(userClient *tg.Client) {
+	u.userClient = userClient
+	if userClient != nil {
+		u.userClients = []*tg.Client{userClient}
+		u.userUp = uploader.NewUploader(userClient).WithPartSize(512 * 1024).WithThreads(16)
+	} else {
+		u.userClients = nil
+		u.userUp = nil
+	}
+}
+
+func (u *TelegramUploader) SetUserClientPool(primary *tg.Client, clients []*tg.Client) {
+	u.userClient = primary
+	if len(clients) > 0 {
+		u.userClients = clients
+	} else if primary != nil {
+		u.userClients = []*tg.Client{primary}
+	} else {
+		u.userClients = nil
+	}
+	if primary != nil {
+		u.userUp = uploader.NewUploader(primary).WithPartSize(512 * 1024).WithThreads(16)
+	} else {
+		u.userUp = nil
+	}
+}
+
+func (u *TelegramUploader) SetDumpChatID(dumpChatID int64) {
+	u.dumpChatID = dumpChatID
+}
+
+type UploadProgressFunc func(curr, total int64, speed float64, eta string)
+
+type UploadOptions struct {
+	FilePath       string
+	FileName       string
+	Caption        string
+	ThumbPath      string
+	CoverPath      string
+	AsDoc          bool
+	DumpChatID     int64
+	LogChatID      int64
+	UserID         int64
+	UserAccessHash int64
+	BotPM          bool
+	IsPremium      bool
+	GID            string
+	OnProgress     UploadProgressFunc
+}
+
+func isTransientUploadError(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, io.EOF) || errors.Is(err, io.ErrUnexpectedEOF) {
+		return true
+	}
+	var netErr net.Error
+	if errors.As(err, &netErr) {
+		return true
+	}
+	errStr := strings.ToLower(err.Error())
+	transientSubstrings := []string{
+		"connection", "reset", "timeout", "deadline", "canceled",
+		"engine was closed", "engine forcibly closed", "broken pipe",
+		"write tcp", "read tcp", "eof", "wsarecv", "wsasend",
+		"forcibly closed", "internal", "worker_busy", "rpc_call_fail",
+		"msg_wait_failed", "transport is closing", "network is unreachable",
+		"temporary failure", "handshake", "flood_wait", "i/o timeout",
+		"broken network", "pipe", "host is down",
+	}
+	for _, sub := range transientSubstrings {
+		if strings.Contains(errStr, sub) {
+			return true
+		}
+	}
+	return false
+}
+
+// uploadFloodCoordinator synchronizes FloodWait backoff across all parallel upload workers
+// without serializing or permanently throttling unpenalized workers.
+type uploadFloodCoordinator struct {
+	floodUntilMs atomic.Int64
+	onFloodWait  func(waitTime time.Duration)
+	paceMu       sync.Mutex
+	lastPace     time.Time
+}
+
+func newUploadFloodCoordinator(onFloodWait func(time.Duration)) *uploadFloodCoordinator {
+	return &uploadFloodCoordinator{
+		onFloodWait: onFloodWait,
+	}
+}
+
+func (c *uploadFloodCoordinator) Pace(ctx context.Context, minInterval time.Duration) error {
+	if minInterval <= 0 {
+		return nil
+	}
+	c.paceMu.Lock()
+	now := time.Now()
+	var wait time.Duration
+	if !c.lastPace.IsZero() {
+		if elapsed := now.Sub(c.lastPace); elapsed < minInterval {
+			wait = minInterval - elapsed
+		}
+	}
+	c.lastPace = now.Add(wait)
+	c.paceMu.Unlock()
+
+	if wait > 0 {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(wait):
+		}
+	}
+	return nil
+}
+
+func (c *uploadFloodCoordinator) WaitIfFlooded(ctx context.Context) error {
+	if until := c.floodUntilMs.Load(); until > 0 {
+		nowMs := time.Now().UnixMilli()
+		if until > nowMs {
+			waitRemaining := time.Duration(until-nowMs) * time.Millisecond
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(waitRemaining):
+			}
+		}
+	}
+	return nil
+}
+
+func (c *uploadFloodCoordinator) HandleFloodWait(waitDur time.Duration, partIndex, totalParts int) {
+	if waitDur < 1*time.Second {
+		waitDur = 1 * time.Second
+	}
+	targetUntil := time.Now().Add(waitDur + 350*time.Millisecond).UnixMilli()
+
+	// Atomically extend floodUntilMs if this event extends the pause window further
+	for {
+		currUntil := c.floodUntilMs.Load()
+		if targetUntil <= currUntil {
+			break
+		}
+		if c.floodUntilMs.CompareAndSwap(currUntil, targetUntil) {
+			log.Printf("[AZML-Go Uploader] Telegram FloodWait of %v on part %d/%d. Pausing upload workers for %v (will resume at full speed)...",
+				waitDur, partIndex, totalParts, (waitDur + 350*time.Millisecond).Round(time.Millisecond))
+			if c.onFloodWait != nil {
+				c.onFloodWait(waitDur)
+			}
+			break
+		}
+	}
+}
+
+func saveBigFilePartWithRetry(ctx context.Context, clients []*tg.Client, workerIdx int, fileID int64, partIndex int, totalParts int, bytes []byte, floodCoord *uploadFloodCoordinator) error {
+	const maxAttempts = 25
+	attempt := 0
+	floodWaitAttempts := 0
+	backoff := 400 * time.Millisecond
+
+	for attempt < maxAttempts {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		default:
+		}
+
+		if floodCoord != nil {
+			if err := floodCoord.WaitIfFlooded(ctx); err != nil {
+				return err
+			}
+		}
+
+		clientToUse := clients[0]
+		if len(clients) > 0 {
+			clientToUse = clients[(workerIdx+attempt)%len(clients)]
+		}
+
+		partCtx, partCancel := context.WithTimeout(ctx, 35*time.Second)
+		_, err := clientToUse.UploadSaveBigFilePart(partCtx, &tg.UploadSaveBigFilePartRequest{
+			FileID:         fileID,
+			FilePart:       partIndex,
+			FileTotalParts: totalParts,
+			Bytes:          bytes,
+		})
+		partCancel()
+		if err == nil {
+			return nil
+		}
+
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+
+		if d, ok := tgerr.AsFloodWait(err); ok {
+			floodWaitAttempts++
+			if floodWaitAttempts > 10 {
+				return fmt.Errorf("flood wait exceeded for part %d: %w", partIndex, err)
+			}
+			if floodCoord != nil {
+				floodCoord.HandleFloodWait(d, partIndex, totalParts)
+			}
+			waitTime := d
+			if waitTime < 1*time.Second {
+				waitTime = 1 * time.Second
+			}
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(waitTime + 350*time.Millisecond):
+			}
+			continue
+		}
+
+		attempt++
+
+		if isTransientUploadError(err) {
+			jitter := time.Duration(rand.Intn(250)) * time.Millisecond
+			sleepDuration := backoff + jitter
+			select {
+			case <-ctx.Done():
+				return ctx.Err()
+			case <-time.After(sleepDuration):
+			}
+			backoff = time.Duration(float64(backoff) * 1.5)
+			if backoff > 6*time.Second {
+				backoff = 6 * time.Second
+			}
+			continue
+		}
+
+		log.Printf("[AZML-Go Uploader] Fatal error uploading part %d: %v", partIndex, err)
+		return err
+	}
+	return fmt.Errorf("exceeded max retries (%d) for part %d", maxAttempts, partIndex)
+}
+
+func (u *TelegramUploader) uploadVideoCover(ctx context.Context, client *tg.Client, peer tg.InputPeerClass, coverPath string) (tg.InputPhotoClass, error) {
+	if coverPath == "" {
+		return nil, nil
+	}
+	if _, err := os.Stat(coverPath); err != nil {
+		return nil, err
+	}
+
+	coverUp := uploader.NewUploader(client).WithPartSize(512 * 1024)
+	coverFile, err := coverUp.FromPath(ctx, coverPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to upload cover file: %w", err)
+	}
+
+	var uploadPeer tg.InputPeerClass = peer
+	if client == u.userClient {
+		uploadPeer = &tg.InputPeerSelf{}
+	} else if uploadPeer == nil {
+		uploadPeer = &tg.InputPeerEmpty{}
+	}
+
+	// Try with the actual target peer first, then fallback to Main Bot's peer if it fails
+	peersToTry := []tg.InputPeerClass{uploadPeer}
+	if u.botClient != nil && u.botClient != client {
+		peersToTry = append(peersToTry, &tg.InputPeerEmpty{})
+	}
+
+	for _, tryPeer := range peersToTry {
+		uploadReq := &tg.MessagesUploadMediaRequest{
+			Peer: tryPeer,
+			Media: &tg.InputMediaUploadedPhoto{
+				File: coverFile,
+			},
+		}
+
+		var mediaRes tg.MessageMediaClass
+		var uploadErr error
+		for attempt := 0; attempt < 3; attempt++ {
+			mediaRes, uploadErr = client.MessagesUploadMedia(ctx, uploadReq)
+			if uploadErr == nil {
+				break
+			}
+			if d, ok := tgerr.AsFloodWait(uploadErr); ok {
+				time.Sleep(d + 500*time.Millisecond)
+				continue
+			}
+			errStr := uploadErr.Error()
+			if strings.Contains(errStr, "PEER_ID_INVALID") || strings.Contains(errStr, "CHAT_ADMIN_REQUIRED") || strings.Contains(errStr, "CHANNEL_INVALID") {
+				break // try next peer
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+		if uploadErr == nil {
+			if photoMedia, ok := mediaRes.(*tg.MessageMediaPhoto); ok {
+				if p, ok := photoMedia.Photo.(*tg.Photo); ok {
+					return p.AsInput(), nil
+				}
+			}
+		}
+	}
+
+	// If all peer attempts failed, skip video cover (thumbFile will still be used)
+	log.Printf("[AZML-Go Uploader] Video cover upload failed for all peers, skipping (thumb will still be attached)")
+	return nil, nil
+}
+
+func (u *TelegramUploader) UploadFile(ctx context.Context, peer tg.InputPeerClass, opt UploadOptions) (*tg.UpdatesClass, error) {
+	fi, err := os.Stat(opt.FilePath)
+	if err != nil {
+		return nil, err
+	}
+	fileSize := fi.Size()
+
+	// Max split limit check: 2GB (non-premium/bot) or 4GB (premium/user)
+	maxLimit := int64(2097152000)
+	if opt.IsPremium || u.userClient != nil {
+		maxLimit = int64(4194304000)
+	}
+	if fileSize > maxLimit {
+		return nil, fmt.Errorf("file size %s exceeds maximum upload limit", ext.GetReadableFileSize(fileSize))
+	}
+
+	const twoGB = int64(2097152000)
+	var clientToUse *tg.Client
+	var uploadBotSession *pool.BotSession
+
+	defer func() {
+		if uploadBotSession != nil {
+			uploadBotSession.ReleaseUpload()
+		}
+	}()
+
+	fromChatID := telegram.PeerToChatID(peer)
+	isGroupChat := (fromChatID != opt.UserID)
+
+	cfg := config.Get()
+	effectiveLogChatID := opt.LogChatID
+	if effectiveLogChatID == 0 && cfg != nil {
+		effectiveLogChatID = cfg.LeechLogID
+	}
+
+	// Transit Bin Channel: The shared channel where all worker bots and Main Bot are present.
+	// Worker bots upload directly here to keep the Leech Group Chat completely clean.
+	transitBinChatID := u.dumpChatID
+	if transitBinChatID == 0 && cfg != nil {
+		transitBinChatID = cfg.DumpChatID
+	}
+
+	// Effective Dump Chat determination:
+	effectiveDumpChatID := opt.DumpChatID
+	if effectiveDumpChatID == 0 {
+		effectiveDumpChatID = transitBinChatID
+	}
+	if effectiveDumpChatID == 0 {
+		effectiveDumpChatID = effectiveLogChatID
+	}
+
+	// Target upload destination determination:
+	var targetUploadChatID int64
+	if fileSize > twoGB {
+		if u.userClient == nil || u.userUp == nil {
+			return nil, fmt.Errorf("file size %s exceeds 2GB limit; USER_SESSION_STRING is required to upload files > 2GB (up to 4GB)", ext.GetReadableFileSize(fileSize))
+		}
+		clientToUse = u.userClient
+		// When uploading with user session string (>2GB files):
+		// Flow MUST BE: upload to Dump Channel first, then dump/forward to User DM!
+		if effectiveDumpChatID != 0 {
+			targetUploadChatID = effectiveDumpChatID
+		} else if opt.UserID != 0 {
+			targetUploadChatID = opt.UserID
+		} else {
+			targetUploadChatID = fromChatID
+		}
+		log.Printf("[AZML-Go Uploader] User session client selected for >2GB upload (target dump chat %d)", targetUploadChatID)
+	} else {
+		// Priority 1: transitBinChatID (keeps Group Chat completely clean; Main Bot distributes to PM & Leech Log)
+		// Priority 2: effectiveLogChatID (Leech Log Channel)
+		// Priority 3: User PM (opt.UserID)
+		// Priority 4: Command chat (fromChatID)
+		if transitBinChatID != 0 {
+			targetUploadChatID = transitBinChatID
+		} else if effectiveLogChatID != 0 {
+			targetUploadChatID = effectiveLogChatID
+		} else if opt.UserID != 0 {
+			targetUploadChatID = opt.UserID
+		} else {
+			targetUploadChatID = fromChatID
+		}
+
+		// Multi-worker bot upload routing:
+		// Only select a worker bot if that bot has confirmed admin posting rights in targetUploadChatID.
+		if u.sessPool != nil && u.sessPool.ActiveSessionCount() > 0 && targetUploadChatID < 0 {
+			wBot := u.sessPool.FindBotForChat(ctx, targetUploadChatID)
+			if wBot != nil {
+				uploadBotSession = wBot
+				clientToUse = wBot.API
+				log.Printf("[AZML-Go Uploader] Worker Bot ...%s selected for upload to target chat %d (active uploads: %d)",
+					wBot.SafeSuffix(), targetUploadChatID, wBot.ActiveUploads.Load())
+			} else {
+				log.Printf("[AZML-Go Uploader] Notice: Worker bots do not have admin posting rights in target chat %d; handing over upload to Main Bot", targetUploadChatID)
+			}
+		}
+
+		// Fallback: Main Bot handles upload directly to targetUploadChatID
+		// (Main Bot has admin rights in Bin Channel, Leech Log Channel, and Leech Group Chat)
+		if clientToUse == nil {
+			clientToUse = u.botClient
+			log.Printf("[AZML-Go Uploader] Main Bot selected for upload (target chat %d)", targetUploadChatID)
+		}
+	}
+
+	uploadStart := time.Now()
+	uploadName := opt.FileName
+	if uploadName == "" {
+		uploadName = filepath.Base(opt.FilePath)
+	}
+
+	gidStr := ""
+	if opt.GID != "" {
+		gidStr = fmt.Sprintf(" (GID: %s)", opt.GID)
+	}
+	log.Printf("[AZML-Go] Upload started: %s%s", uploadName, gidStr)
+
+	tracker := &uploadProgressTracker{
+		uploadStart: uploadStart,
+		onProgress:  opt.OnProgress,
+	}
+
+	var uploadedFile tg.InputFileClass
+
+	// For small files (< 10 MB), use standard uploader
+	if fileSize < 10*1024*1024 {
+		up := uploader.NewUploader(clientToUse).
+			WithPartSize(512 * 1024).
+			WithThreads(4).
+			WithProgress(tracker)
+
+		for attempt := 1; attempt <= 5; attempt++ {
+			uploadedFile, err = up.FromPath(ctx, opt.FilePath)
+			if err == nil {
+				break
+			}
+			if ctx.Err() != nil {
+				return nil, fmt.Errorf("upload cancelled: %v", ctx.Err())
+			}
+			log.Printf("[AZML-Go Uploader] Upload attempt %d failed for %s: %v. Retrying in 1s...", attempt, opt.FileName, err)
+			time.Sleep(1 * time.Second)
+		}
+		if err != nil {
+			return nil, fmt.Errorf("failed to upload small file parts: %v", err)
+		}
+	} else {
+		// Large file (>= 10 MB): Multi-worker chunk uploader with per-part retries (handles broken pipe seamlessly)
+		partSize := int64(512 * 1024)
+		totalParts := int32((fileSize + partSize - 1) / partSize)
+		fileID := randID()
+
+		f, openErr := os.Open(opt.FilePath)
+		if openErr != nil {
+			return nil, fmt.Errorf("failed to open file for parallel upload: %w", openErr)
+		}
+		defer f.Close()
+
+		tasks := make(chan int32, totalParts)
+		for i := int32(0); i < totalParts; i++ {
+			tasks <- i
+		}
+		close(tasks)
+
+		var uploadedBytes atomic.Int64
+		var errOnce sync.Once
+		var firstErr error
+
+		isUserUpload := clientToUse == u.userClient && u.userClient != nil
+		uploadClients := []*tg.Client{clientToUse}
+		numWorkers := 8
+		maxWorkers := 8
+		if isUserUpload {
+			if len(u.userClients) > 0 {
+				uploadClients = u.userClients
+			}
+			numWorkers = len(uploadClients)
+			if numWorkers < 14 {
+				numWorkers = 14
+			}
+			maxWorkers = 20
+		}
+		if envVal := os.Getenv("UPLOAD_THREADS"); envVal != "" {
+			if val, pErr := strconv.Atoi(envVal); pErr == nil && val > 0 {
+				numWorkers = val
+			}
+		}
+		if numWorkers > maxWorkers {
+			numWorkers = maxWorkers
+		}
+		if numWorkers < 2 {
+			numWorkers = 2
+		}
+		if int(totalParts) < numWorkers {
+			numWorkers = int(totalParts)
+		}
+
+		floodCoord := newUploadFloodCoordinator(func(waitDur time.Duration) {
+			if uploadBotSession != nil {
+				uploadBotSession.SetCooldown(int64(waitDur.Seconds()) + 10)
+			}
+		})
+
+		var wg sync.WaitGroup
+		for w := 0; w < numWorkers; w++ {
+			wg.Add(1)
+			go func(workerID int) {
+				defer wg.Done()
+				// Micro-stagger worker start to avoid simultaneous TCP connection handshakes
+				time.Sleep(time.Duration(workerID*10) * time.Millisecond)
+
+				// Pre-allocate buffer once per worker to prevent continuous heap allocations and GC pauses
+				workerBuf := make([]byte, partSize)
+
+				for partIndex := range tasks {
+					if firstErr != nil || ctx.Err() != nil {
+						return
+					}
+					off := int64(partIndex) * partSize
+					pLen := partSize
+					if off+pLen > fileSize {
+						pLen = fileSize - off
+					}
+
+					n, rErr := f.ReadAt(workerBuf[:pLen], off)
+					if rErr != nil && rErr != io.EOF {
+						errOnce.Do(func() {
+							firstErr = fmt.Errorf("failed to read part %d: %w", partIndex, rErr)
+						})
+						return
+					}
+
+					saveErr := saveBigFilePartWithRetry(ctx, uploadClients, workerID, fileID, int(partIndex), int(totalParts), workerBuf[:n], floodCoord)
+					if saveErr != nil {
+						errOnce.Do(func() {
+							firstErr = fmt.Errorf("UploadSaveBigFilePart failed for part %d: %w", partIndex, saveErr)
+						})
+						return
+					}
+
+					done := uploadedBytes.Add(int64(n))
+					tracker.Report(done, fileSize)
+				}
+			}(w)
+		}
+
+		wg.Wait()
+		if firstErr != nil {
+			return nil, firstErr
+		}
+		if ctx.Err() != nil {
+			return nil, ctx.Err()
+		}
+
+		uploadedFile = &tg.InputFileBig{
+			ID:    fileID,
+			Parts: int(totalParts),
+			Name:  uploadName,
+		}
+	}
+
+	var attributes []tg.DocumentAttributeClass
+	extName := strings.ToLower(filepath.Ext(opt.FilePath))
+	isVideo := isVideoExt(extName)
+	isAudio := isAudioExt(extName) && !opt.AsDoc
+
+	var thumbFile tg.InputFileClass
+	thumbPathToUse := opt.ThumbPath
+	if thumbPathToUse == "" && opt.CoverPath != "" {
+		thumbPathToUse = opt.CoverPath
+	}
+	if thumbPathToUse != "" {
+		if _, statErr := os.Stat(thumbPathToUse); statErr == nil {
+			if thumbHandle, tErr := uploader.NewUploader(clientToUse).FromPath(ctx, thumbPathToUse); tErr == nil {
+				thumbFile = thumbHandle
+			} else {
+				log.Printf("[AZML-Go Uploader] Failed to upload thumb: %v", tErr)
+			}
+		}
+	}
+
+	uploadPeer := peer
+	actualDestChatID := fromChatID
+
+	// Destination routing:
+	// Set uploadPeer to the chat that matches targetUploadChatID
+	if targetUploadChatID < 0 {
+		chID := getChannelID(targetUploadChatID)
+		var hash int64
+		if uploadBotSession != nil {
+			if inChan, err := uploadBotSession.ResolveChannel(ctx, targetUploadChatID); err == nil && inChan != nil {
+				hash = inChan.AccessHash
+			}
+		}
+		if hash == 0 {
+			hash = telegram.ResolveChannelAccessHash(ctx, clientToUse, targetUploadChatID)
+		}
+		if hash == 0 && u.botClient != nil && clientToUse != u.botClient {
+			hash = telegram.ResolveChannelAccessHash(ctx, u.botClient, targetUploadChatID)
+		}
+		if hash == 0 {
+			hash = telegram.GetChannelAccessHash(chID)
+		}
+		if hash != 0 {
+			uploadPeer = &tg.InputPeerChannel{
+				ChannelID:  chID,
+				AccessHash: hash,
+			}
+			actualDestChatID = targetUploadChatID
+			log.Printf("[AZML-Go Uploader] Uploading to channel %d", targetUploadChatID)
+		} else {
+			log.Printf("[AZML-Go Uploader] Warning: Could not resolve access hash for target channel %d", targetUploadChatID)
+		}
+	} else if targetUploadChatID == opt.UserID && opt.UserID != 0 {
+		uHash := opt.UserAccessHash
+		if uHash == 0 {
+			uHash = telegram.GetUserAccessHash(opt.UserID)
+		}
+		if uHash != 0 {
+			uploadPeer = &tg.InputPeerUser{
+				UserID:     opt.UserID,
+				AccessHash: uHash,
+			}
+			actualDestChatID = opt.UserID
+			log.Printf("[AZML-Go Uploader] Uploading directly to User PM %d", opt.UserID)
+		}
+	} else {
+		// Fallback to command peer
+		uploadPeer = peer
+		actualDestChatID = fromChatID
+		log.Printf("[AZML-Go Uploader] Uploading to command chat %d", fromChatID)
+	}
+
+	var videoCover tg.InputPhotoClass
+	if isVideo {
+		coverPath := opt.CoverPath
+		if coverPath == "" {
+			coverPath = opt.ThumbPath
+		}
+		if coverPath != "" {
+			cov, cErr := u.uploadVideoCover(ctx, clientToUse, uploadPeer, coverPath)
+			if cErr == nil && cov != nil {
+				videoCover = cov
+			} else if cErr != nil {
+				log.Printf("[AZML-Go Uploader] Failed to upload video cover from %s: %v", coverPath, cErr)
+			}
+		}
+	}
+
+	attributes = append(attributes, &tg.DocumentAttributeFilename{
+		FileName: uploadName,
+	})
+
+	mimeType := "application/octet-stream"
+	if isVideo {
+		realExt := ext.DetectExtension(opt.FilePath)
+		effectiveExt := extName
+		if realExt != "" {
+			effectiveExt = realExt
+		}
+
+		if !opt.AsDoc && (effectiveExt == ".mp4" || extName == ".mp4") {
+			mimeType = "video/mp4"
+		} else {
+			switch effectiveExt {
+			case ".mkv":
+				mimeType = "video/x-matroska"
+			case ".webm":
+				mimeType = "video/webm"
+			case ".mp4", ".m4v":
+				mimeType = "video/mp4"
+			case ".avi":
+				mimeType = "video/x-msvideo"
+			default:
+				mimeType = "video/mp4"
+			}
+		}
+		details, _ := ext.ProbeMedia(opt.FilePath)
+		dur := 0
+		w := 1280
+		h := 720
+		if details != nil {
+			if details.Duration > 0 {
+				dur = details.Duration
+			}
+			if details.Width > 0 && details.Height > 0 {
+				w = details.Width
+				h = details.Height
+			}
+		}
+		attributes = append(attributes, &tg.DocumentAttributeVideo{
+			SupportsStreaming: true,
+			Duration:          float64(dur),
+			W:                 w,
+			H:                 h,
+		})
+	} else if isAudio {
+		mimeType = "audio/mpeg"
+		details, _ := ext.ProbeMedia(opt.FilePath)
+		dur := 0
+		title := uploadName
+		performer := "AZML"
+		if details != nil {
+			dur = details.Duration
+			if details.Title != "" {
+				title = details.Title
+			}
+			if details.Artist != "" {
+				performer = details.Artist
+			}
+		}
+		attributes = append(attributes, &tg.DocumentAttributeAudio{
+			Duration:  dur,
+			Title:     title,
+			Performer: performer,
+		})
+	}
+
+	inputMedia := &tg.InputMediaUploadedDocument{
+		File:       uploadedFile,
+		MimeType:   mimeType,
+		Attributes: attributes,
+		ForceFile:  opt.AsDoc,
+	}
+	if thumbFile != nil {
+		inputMedia.SetThumb(thumbFile)
+	}
+	if videoCover != nil {
+		inputMedia.SetVideoCover(videoCover)
+	}
+
+	plainCaption, captionEntities := telegram.ParseFormatting(opt.Caption)
+	if len(plainCaption) > 1024 {
+		plainCaption = plainCaption[:1020] + "..."
+		plainCaption, captionEntities = telegram.ParseFormatting(plainCaption)
+	}
+
+	req := &tg.MessagesSendMediaRequest{
+		Peer:     uploadPeer,
+		Media:    inputMedia,
+		Message:  plainCaption,
+		Entities: captionEntities,
+		RandomID: time.Now().UnixNano(),
+	}
+
+	var res tg.UpdatesClass
+	var sendErr error
+	for attempt := 0; attempt < 10; attempt++ {
+		res, sendErr = clientToUse.MessagesSendMedia(ctx, req)
+		if sendErr == nil {
+			break
+		}
+		// Handle FloodWait on SendMedia
+		if d, ok := tgerr.AsFloodWait(sendErr); ok {
+			waitDur := d
+			if waitDur < 1*time.Second {
+				waitDur = 1 * time.Second
+			}
+			log.Printf("[AZML-Go Uploader] FloodWait %v on MessagesSendMedia (attempt %d/10), waiting...", waitDur, attempt+1)
+			if uploadBotSession != nil {
+				uploadBotSession.SetCooldown(int64(waitDur.Seconds()) + 15)
+			}
+			time.Sleep(waitDur + 500*time.Millisecond)
+			continue
+		}
+		errStr := sendErr.Error()
+
+		// Inter-DC or internal server errors (500) during cross-DC media linking:
+		// When uploading files across datacenters (e.g., DC1 session to DC5 channel),
+		// Telegram can return INTERDC_CALL_ERROR while establishing cross-DC media references.
+		// Retrying the same target channel with exponential backoff resolves this seamlessly.
+		if strings.Contains(errStr, "INTERDC_CALL_ERROR") || strings.Contains(errStr, "rpc error code 500") ||
+			strings.Contains(errStr, "INTERNAL") || strings.Contains(errStr, "RPC_CALL_FAIL") {
+			backoff := time.Duration((attempt+1)*3) * time.Second
+			log.Printf("[AZML-Go Uploader] Inter-DC / Server error on MessagesSendMedia (%v) (attempt %d/10). Retrying to target peer in %v...", sendErr, attempt+1, backoff)
+			time.Sleep(backoff)
+			continue
+		}
+
+		// Transient network or connection disconnects
+		if strings.Contains(errStr, "engine was closed") || strings.Contains(errStr, "engine forcibly closed") ||
+			strings.Contains(errStr, "connection") || strings.Contains(errStr, "reset") ||
+			strings.Contains(errStr, "timeout") || strings.Contains(errStr, "deadline") ||
+			strings.Contains(errStr, "broken pipe") || strings.Contains(errStr, "write tcp") {
+			log.Printf("[AZML-Go Uploader] Warning: MessagesSendMedia failed (attempt %d/10): %v. Retrying in 2s...", attempt+1, sendErr)
+			time.Sleep(2 * time.Second)
+			continue
+		}
+
+		// Fallback to command peer ONLY for Main Bot with explicit permission rejection, NEVER for user client or transient errors
+		if uploadBotSession == nil && clientToUse == u.botClient && uploadPeer != peer && attempt < 2 {
+			if strings.Contains(errStr, "CHAT_ADMIN_REQUIRED") || strings.Contains(errStr, "CHAT_WRITE_FORBIDDEN") ||
+				strings.Contains(errStr, "CHANNEL_PRIVATE") {
+				log.Printf("[AZML-Go Uploader] Upload to preferred peer failed with permission error (%v), falling back to command peer", sendErr)
+				uploadPeer = peer
+				actualDestChatID = fromChatID
+				req.Peer = peer
+				continue
+			}
+		}
+
+		break
+	}
+	if sendErr != nil {
+		log.Printf("[AZML-Go Uploader] MessagesSendMedia FAILED for %s (%d bytes) to peer %T: %v", opt.FileName, fileSize, uploadPeer, sendErr)
+		return nil, fmt.Errorf("failed to send uploaded media: %v", sendErr)
+	}
+	log.Printf("[AZML-Go Uploader] Successfully sent uploaded media for %s to peer %T!", opt.FileName, uploadPeer)
+
+	msgID := telegram.ExtractMessageID(res)
+	if msgID > 0 {
+		botToken := ""
+		if cfg != nil {
+			botToken = cfg.BotToken
+		}
+		if botToken == "" {
+			botToken = os.Getenv("BOT_TOKEN")
+		}
+
+		sentChats := make(map[int64]bool)
+		sentChats[actualDestChatID] = true
+
+		// Build source peers for forwarding from actualDestChatID
+		var mainBotSourcePeer tg.InputPeerClass
+		var userClientSourcePeer tg.InputPeerClass
+
+		if actualDestChatID < 0 {
+			srcChID := getChannelID(actualDestChatID)
+			srcHash := telegram.ResolveChannelAccessHash(ctx, u.botClient, actualDestChatID)
+			if srcHash == 0 {
+				srcHash = telegram.GetChannelAccessHash(srcChID)
+			}
+			if srcHash == 0 {
+				if chPeer, ok := uploadPeer.(*tg.InputPeerChannel); ok {
+					srcHash = chPeer.AccessHash
+				}
+			}
+			mainBotSourcePeer = &tg.InputPeerChannel{
+				ChannelID:  srcChID,
+				AccessHash: srcHash,
+			}
+
+			if u.userClient != nil {
+				userHash := telegram.ResolveChannelAccessHash(ctx, u.userClient, actualDestChatID)
+				if userHash == 0 {
+					userHash = srcHash
+				}
+				userClientSourcePeer = &tg.InputPeerChannel{
+					ChannelID:  srcChID,
+					AccessHash: userHash,
+				}
+			}
+		} else {
+			uHash := opt.UserAccessHash
+			if uHash == 0 {
+				uHash = telegram.GetUserAccessHash(actualDestChatID)
+			}
+			mainBotSourcePeer = &tg.InputPeerUser{
+				UserID:     actualDestChatID,
+				AccessHash: uHash,
+			}
+			if u.userClient != nil {
+				userClientSourcePeer = mainBotSourcePeer
+			}
+		}
+
+		// Helper to safely deliver (copy or forward) from dump channel to a target peer
+		deliverMedia := func(targetChatID int64, toUserAccessHash int64, desc string) bool {
+			if targetChatID == 0 || targetChatID == actualDestChatID || sentChats[targetChatID] {
+				return true
+			}
+			sentChats[targetChatID] = true
+
+			// 1. Try copyMessageViaBotAPI for files <= 2GB (clean copy without forward tag)
+			if fileSize <= twoGB {
+				if copyMessageViaBotAPI(botToken, targetChatID, actualDestChatID, msgID) {
+					log.Printf("[AZML-Go Uploader] Successfully copied media to %s (%d) via Bot API", desc, targetChatID)
+					return true
+				}
+			}
+
+			// 2. MTProto forward
+			var toPeer tg.InputPeerClass
+			if targetChatID < 0 {
+				tgtChID := getChannelID(targetChatID)
+				tgtHash := telegram.ResolveChannelAccessHash(ctx, u.botClient, targetChatID)
+				if tgtHash == 0 {
+					tgtHash = telegram.GetChannelAccessHash(tgtChID)
+				}
+				toPeer = &tg.InputPeerChannel{
+					ChannelID:  tgtChID,
+					AccessHash: tgtHash,
+				}
+			} else {
+				uHash := toUserAccessHash
+				if uHash == 0 {
+					uHash = telegram.GetUserAccessHash(targetChatID)
+				}
+				toPeer = &tg.InputPeerUser{
+					UserID:     targetChatID,
+					AccessHash: uHash,
+				}
+			}
+
+			// Method A: Main Bot forward with DropAuthor: true
+			_, pErr := u.botClient.MessagesForwardMessages(ctx, &tg.MessagesForwardMessagesRequest{
+				FromPeer:   mainBotSourcePeer,
+				ToPeer:     toPeer,
+				ID:         []int{msgID},
+				RandomID:   []int64{time.Now().UnixNano() + 1},
+				DropAuthor: true,
+			})
+			if pErr == nil {
+				log.Printf("[AZML-Go Uploader] Successfully forwarded media to %s (%d) via Main Bot (drop_author=true)", desc, targetChatID)
+				return true
+			}
+			log.Printf("[AZML-Go Uploader] Main Bot forward (drop_author=true) to %s failed: %v. Retrying with drop_author=false...", desc, pErr)
+
+			// Method B: Main Bot forward with DropAuthor: false (standard forward allowed for >2GB on Telegram)
+			_, pErr2 := u.botClient.MessagesForwardMessages(ctx, &tg.MessagesForwardMessagesRequest{
+				FromPeer:   mainBotSourcePeer,
+				ToPeer:     toPeer,
+				ID:         []int{msgID},
+				RandomID:   []int64{time.Now().UnixNano() + 2},
+				DropAuthor: false,
+			})
+			if pErr2 == nil {
+				log.Printf("[AZML-Go Uploader] Successfully forwarded media to %s (%d) via Main Bot (drop_author=false)", desc, targetChatID)
+				return true
+			}
+			log.Printf("[AZML-Go Uploader] Main Bot forward (drop_author=false) to %s failed: %v", desc, pErr2)
+
+			// Method C: User Session Client forward (Premium authorized, handles 4GB transfers)
+			if u.userClient != nil && userClientSourcePeer != nil {
+				log.Printf("[AZML-Go Uploader] Attempting forward to %s (%d) via User Session client...", desc, targetChatID)
+				_, uErr := u.userClient.MessagesForwardMessages(ctx, &tg.MessagesForwardMessagesRequest{
+					FromPeer:   userClientSourcePeer,
+					ToPeer:     toPeer,
+					ID:         []int{msgID},
+					RandomID:   []int64{time.Now().UnixNano() + 3},
+					DropAuthor: true,
+				})
+				if uErr == nil {
+					log.Printf("[AZML-Go Uploader] Successfully forwarded media to %s (%d) via User Session (drop_author=true)", desc, targetChatID)
+					return true
+				}
+				log.Printf("[AZML-Go Uploader] User Session forward (drop_author=true) to %s failed: %v. Retrying with drop_author=false...", desc, uErr)
+
+				_, uErr2 := u.userClient.MessagesForwardMessages(ctx, &tg.MessagesForwardMessagesRequest{
+					FromPeer:   userClientSourcePeer,
+					ToPeer:     toPeer,
+					ID:         []int{msgID},
+					RandomID:   []int64{time.Now().UnixNano() + 4},
+					DropAuthor: false,
+				})
+				if uErr2 == nil {
+					log.Printf("[AZML-Go Uploader] Successfully forwarded media to %s (%d) via User Session (drop_author=false)", desc, targetChatID)
+					return true
+				}
+				log.Printf("[AZML-Go Uploader] User Session forward (drop_author=false) to %s failed: %v", desc, uErr2)
+			}
+
+			return false
+		}
+
+		// 0. Send to User Personal Dump channel (if user explicitly configured /setdump or -dump)
+		if opt.DumpChatID != 0 {
+			deliverMedia(opt.DumpChatID, 0, "User Dump")
+		}
+
+		// 1. Send to User PM - ensure user gets the file in PM cleanly (Dump -> User DM)
+		if opt.UserID != 0 {
+			deliverMedia(opt.UserID, opt.UserAccessHash, "User DM")
+		}
+
+		// 2. Send to Leech Log ID via Main Bot (Main Bot is already admin in Leech Log)
+		if effectiveLogChatID != 0 {
+			deliverMedia(effectiveLogChatID, 0, "Leech Log")
+		}
+
+		// 3. Clean up intermediate upload in group chat if it was only used for worker bot transfer
+		if isGroupChat && actualDestChatID == fromChatID {
+			// User requested: "jismein leech kar raha usmein file na aaye only pm and leech log id mein"
+			go func(chatID int64, mID int) {
+				time.Sleep(1500 * time.Millisecond)
+				if !deleteMessageViaBotAPI(botToken, chatID, mID) {
+					switch p := peer.(type) {
+					case *tg.InputPeerChannel:
+						_, _ = clientToUse.ChannelsDeleteMessages(context.Background(), &tg.ChannelsDeleteMessagesRequest{
+							Channel: &tg.InputChannel{
+								ChannelID:  p.ChannelID,
+								AccessHash: p.AccessHash,
+							},
+							ID: []int{mID},
+						})
+					default:
+						_, _ = clientToUse.MessagesDeleteMessages(context.Background(), &tg.MessagesDeleteMessagesRequest{
+							Revoke: true,
+							ID:     []int{mID},
+						})
+					}
+				}
+			}(fromChatID, msgID)
+		}
+	}
+
+	return &res, nil
+}
+
+type uploadProgressTracker struct {
+	uploadStart time.Time
+	lastReport  time.Time
+	onProgress  UploadProgressFunc
+	mu          sync.Mutex
+}
+
+func (t *uploadProgressTracker) Report(uploaded, total int64) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if time.Since(t.lastReport) >= 1500*time.Millisecond || uploaded >= total {
+		elapsed := time.Since(t.uploadStart).Seconds()
+		speed := float64(0)
+		if elapsed > 0 {
+			speed = float64(uploaded) / elapsed
+		}
+		eta := "-"
+		if speed > 0 && total > uploaded {
+			remSec := int64(float64(total-uploaded) / speed)
+			eta = ext.GetReadableTime(remSec)
+		}
+		if t.onProgress != nil {
+			t.onProgress(uploaded, total, speed, eta)
+		}
+		t.lastReport = time.Now()
+	}
+}
+
+func (t *uploadProgressTracker) Chunk(ctx context.Context, state uploader.ProgressState) error {
+	t.Report(state.Uploaded, state.Total)
+	return nil
+}
+
+func isVideoExt(ext string) bool {
+	switch ext {
+	case ".mp4", ".mkv", ".webm", ".avi", ".mov", ".flv", ".wmv", ".m4v", ".ts":
+		return true
+	}
+	return false
+}
+
+func isAudioExt(ext string) bool {
+	switch ext {
+	case ".mp3", ".m4a", ".flac", ".wav", ".ogg", ".opus", ".aac", ".wma":
+		return true
+	}
+	return false
+}
+
+func getChannelID(id int64) int64 {
+	idStr := fmt.Sprintf("%d", id)
+	if strings.HasPrefix(idStr, "-100") {
+		idStr = strings.TrimPrefix(idStr, "-100")
+		var cleanID int64
+		_, _ = fmt.Sscanf(idStr, "%d", &cleanID)
+		return cleanID
+	}
+	if id < 0 {
+		return -id
+	}
+	return id
+}
+
+type UploadTask struct {
+	gid       string
+	name      string
+	size      int64
+	curr      int64
+	speed     float64
+	eta       string
+	startTime time.Time
+	status    types.TaskStatus
+	cancelFn  context.CancelFunc
+	chatID    int64
+	userID    int64
+	msgID     int
+	mu        sync.RWMutex
+}
+
+func NewUploadTask(gid, name string, size int64, chatID, userID int64, msgID int, cancelFn context.CancelFunc) *UploadTask {
+	return &UploadTask{
+		gid:       gid,
+		name:      name,
+		size:      size,
+		status:    types.StatusUploading,
+		startTime: time.Now(),
+		cancelFn:  cancelFn,
+		chatID:    chatID,
+		userID:    userID,
+		msgID:     msgID,
+	}
+}
+
+func (t *UploadTask) GID() string              { return t.gid }
+func (t *UploadTask) Name() string             { return t.name }
+func (t *UploadTask) Size() int64              { return t.size }
+func (t *UploadTask) DownloadedBytes() int64   { return t.curr }
+func (t *UploadTask) Speed() float64           { return t.speed }
+func (t *UploadTask) Status() types.TaskStatus { return t.status }
+func (t *UploadTask) Engine() string           { return "MTProto" }
+func (t *UploadTask) StartTime() time.Time     { return t.startTime }
+func (t *UploadTask) MessageID() int           { return t.msgID }
+func (t *UploadTask) ChatID() int64            { return t.chatID }
+func (t *UploadTask) UserID() int64            { return t.userID }
+func (t *UploadTask) Progress() float64 {
+	if t.size <= 0 {
+		return 0
+	}
+	return (float64(t.curr) / float64(t.size)) * 100
+}
+func (t *UploadTask) ETA() string {
+	if t.eta != "" {
+		return t.eta
+	}
+	if t.speed <= 0 || t.size <= 0 {
+		return "-"
+	}
+	rem := t.size - t.curr
+	if rem <= 0 {
+		return "0s"
+	}
+	return ext.GetReadableTime(int64(float64(rem) / t.speed))
+}
+func (t *UploadTask) Cancel() error {
+	t.mu.Lock()
+	cancel := t.cancelFn
+	t.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+	return nil
+}
+func (t *UploadTask) Update(curr, total int64, speed float64, eta string) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	t.curr = curr
+	if total > 0 {
+		t.size = total
+	}
+	t.speed = speed
+	t.eta = eta
+}
