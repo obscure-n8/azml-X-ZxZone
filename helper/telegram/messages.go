@@ -281,6 +281,21 @@ func parseFloodWait(err error) (time.Duration, bool) {
 }
 
 func (m *MessageSender) SendMessage(ctx context.Context, peer tg.InputPeerClass, text string, replyToID int, markup tg.ReplyMarkupClass) (int, error) {
+	switch peer.(type) {
+	case *tg.InputPeerChat, *tg.InputPeerChannel:
+		botToken := getBotToken()
+		chatID := PeerToChatID(peer)
+		if botToken != "" && chatID != 0 {
+			sendCtx, cancel := context.WithTimeout(ctx, 3*time.Second)
+			sentID, err := m.sendBotAPIMessage(sendCtx, botToken, chatID, text, replyToID, markup)
+			cancel()
+			if err == nil {
+				return sentID, nil
+			}
+			log.Printf("[AZML-Go Bot Client] Bot API send to group chat %d failed; falling back to MTProto: %v", chatID, err)
+		}
+	}
+
 	plainText, entities := ParseFormatting(text)
 	req := &tg.MessagesSendMessageRequest{
 		Peer:     peer,
