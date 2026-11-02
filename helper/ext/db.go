@@ -116,8 +116,8 @@ func (d *DatabaseManager) SaveUser(u *types.UserSettings) error {
 		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
 
-		opts := options.Update().SetUpsert(true)
-		_, err := d.usersCol.UpdateOne(ctx, bson.M{"_id": u.UserID}, bson.M{"$set": u}, opts)
+		opts := options.Replace().SetUpsert(true)
+		_, err := d.usersCol.ReplaceOne(ctx, bson.M{"_id": u.UserID}, u, opts)
 		return err
 	}
 

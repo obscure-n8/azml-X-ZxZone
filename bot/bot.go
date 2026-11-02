@@ -955,7 +955,9 @@ func (b *BotApp) Start(ctx context.Context) error {
 		}
 
 		// Ensure Aria2c is up with 16 connections
-		_ = ext.DB.LoadAllUsers(b.userMap)
+		if err := ext.DB.LoadAllUsers(b.userMap); err != nil {
+			log.Printf("[AZML-Go Bot Client] Failed to load persisted user and authorization data: %v", err)
+		}
 		log.Println("[AZML-Go Bot Client] AZML-Go started and listening for commands!")
 
 		// Trigger startup notification

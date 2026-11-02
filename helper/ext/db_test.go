@@ -2,7 +2,10 @@ package ext
 
 import (
 	"os"
+	"path/filepath"
 	"testing"
+
+	"azml-go/types"
 )
 
 func TestBotSettingsPersistence(t *testing.T) {
@@ -48,5 +51,28 @@ func TestBotSettingsPersistence(t *testing.T) {
 	settingsAfter, _ := mgr.LoadAllBotSettings()
 	if _, ok := settingsAfter["USER_SESSION_STRING"]; ok {
 		t.Errorf("expected USER_SESSION_STRING to be removed from settings map")
+	}
+}
+
+func TestAuthorizedChatPersistsAcrossUserMapReload(t *testing.T) {
+	mgr := &DatabaseManager{
+		localFile:         filepath.Join(t.TempDir(), "user_data.json"),
+		localSettingsFile: filepath.Join(t.TempDir(), "bot_settings.json"),
+	}
+	const chatID int64 = -1101234567890
+
+	u := types.NewSafeUserMap().GetOrCreate(chatID)
+	u.IsAuth = true
+	if err := mgr.SaveUser(u); err != nil {
+		t.Fatalf("failed to save authorized chat: %v", err)
+	}
+
+	reloadedUsers := types.NewSafeUserMap()
+	if err := mgr.LoadAllUsers(reloadedUsers); err != nil {
+		t.Fatalf("failed to reload authorized chat: %v", err)
+	}
+	reloaded := reloadedUsers.Get(chatID)
+	if reloaded == nil || !reloaded.IsAuth {
+		t.Fatalf("expected chat %d to remain authorized after reload", chatID)
 	}
 }

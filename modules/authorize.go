@@ -3,6 +3,7 @@ package modules
 import (
 	"context"
 	"fmt"
+	"log"
 	"regexp"
 	"strconv"
 	"strings"
@@ -41,8 +42,19 @@ func (m *AuthorizeModule) HandleAuthorize(ctx context.Context, peer tg.InputPeer
 	}
 
 	u := m.userMap.GetOrCreate(targetID)
+	wasAuthorized := u.IsAuth
 	u.IsAuth = true
-	_ = ext.DB.SaveUser(u)
+	if db := ext.GetDB(); db == nil {
+		u.IsAuth = wasAuthorized
+		log.Printf("[Authorize] Cannot persist authorization for %d: database is not initialized", targetID)
+		_, _ = m.sender.SendMessage(ctx, peer, "× <b>Authorization was not saved.</b> Database is unavailable; please try again later.", msg.MessageID, nil)
+		return
+	} else if err := db.SaveUser(u); err != nil {
+		u.IsAuth = wasAuthorized
+		log.Printf("[Authorize] Failed to persist authorization for %d: %v", targetID, err)
+		_, _ = m.sender.SendMessage(ctx, peer, "× <b>Authorization was not saved.</b> Database error; please try again later.", msg.MessageID, nil)
+		return
+	}
 	_, _ = m.sender.SendMessage(ctx, peer, fmt.Sprintf("✓ <b>Authorized:</b> <code>%d</code>", targetID), msg.MessageID, nil)
 }
 
@@ -58,8 +70,19 @@ func (m *AuthorizeModule) HandleUnauthorize(ctx context.Context, peer tg.InputPe
 	}
 
 	u := m.userMap.GetOrCreate(targetID)
+	wasAuthorized := u.IsAuth
 	u.IsAuth = false
-	_ = ext.DB.SaveUser(u)
+	if db := ext.GetDB(); db == nil {
+		u.IsAuth = wasAuthorized
+		log.Printf("[Authorize] Cannot persist unauthorization for %d: database is not initialized", targetID)
+		_, _ = m.sender.SendMessage(ctx, peer, "× <b>Unauthorization was not saved.</b> Database is unavailable; please try again later.", msg.MessageID, nil)
+		return
+	} else if err := db.SaveUser(u); err != nil {
+		u.IsAuth = wasAuthorized
+		log.Printf("[Authorize] Failed to persist unauthorization for %d: %v", targetID, err)
+		_, _ = m.sender.SendMessage(ctx, peer, "× <b>Unauthorization was not saved.</b> Database error; please try again later.", msg.MessageID, nil)
+		return
+	}
 	_, _ = m.sender.SendMessage(ctx, peer, fmt.Sprintf("× <b>Unauthorized:</b> <code>%d</code>", targetID), msg.MessageID, nil)
 }
 
