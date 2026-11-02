@@ -297,29 +297,30 @@ func (m *MessageSender) SendMessage(ctx context.Context, peer tg.InputPeerClass,
 		req.ReplyMarkup = markup
 	}
 
-	for attempt := 0; attempt < 5; attempt++ {
-		req.RandomID = time.Now().UnixNano()
-		updates, err := m.rawClient.MessagesSendMessage(ctx, req)
-		if err == nil {
-			return ExtractMessageID(updates), nil
-		}
-		if d, ok := parseFloodWait(err); ok {
-			if d > 60*time.Second {
-				d = 60 * time.Second
-			}
-			select {
-			case <-time.After(d + 200*time.Millisecond):
-				continue
-			case <-ctx.Done():
-				return 0, ctx.Err()
-			}
-		}
-		if attempt == 4 {
-			log.Printf("[AZML-Go Bot Client] Error sending message to peer %T: %v", peer, err)
-		}
-		return 0, err
+	req.RandomID = time.Now().UnixNano()
+	updates, err := m.rawClient.MessagesSendMessage(ctx, req)
+	if err == nil {
+		return ExtractMessageID(updates), nil
 	}
-	return 0, fmt.Errorf("failed to send message after retries")
+
+	if wait, ok := parseFloodWait(err); ok {
+		log.Printf("[AZML-Go Bot Client] MTProto send to peer %T was rate limited for %v; trying Bot API without waiting", peer, wait)
+		botToken := getBotToken()
+		chatID := PeerToChatID(peer)
+		if botToken == "" || chatID == 0 {
+			return 0, fmt.Errorf("telegram rate limited message for %s and Bot API fallback is unavailable: %w", wait, err)
+		}
+
+		sentID, fallbackErr := m.sendBotAPIMessage(ctx, botToken, chatID, text, replyToID, markup)
+		if fallbackErr != nil {
+			log.Printf("[AZML-Go Bot Client] Bot API fallback failed after MTProto rate limit: %v", fallbackErr)
+			return 0, fmt.Errorf("telegram rate limited message for %s; Bot API fallback failed: %w (MTProto error: %v)", wait, fallbackErr, err)
+		}
+		return sentID, nil
+	}
+
+	log.Printf("[AZML-Go Bot Client] Error sending message to peer %T: %v", peer, err)
+	return 0, err
 }
 
 func (m *MessageSender) EditMessage(ctx context.Context, peer tg.InputPeerClass, msgID int, text string, markup tg.ReplyMarkupClass) error {
@@ -413,7 +414,7 @@ func (m *MessageSender) EditMessageWithButtons(ctx context.Context, peer tg.Inpu
 	return m.EditMessage(ctx, peer, msgID, text, btn.BuildMenu(cols))
 }
 
-func (m *MessageSender) sendBotAPIMessage(ctx context.Context, botToken string, chatID int64, text string, replyToID int, btn *ButtonMaker, cols int) (int, error) {
+func (m *MessageSender) sendBotAPIMessage(ctx context.Context, botToken string, chatID int64, text string, replyToID int, markup tg.ReplyMarkupClass) (int, error) {
 	payload := map[string]interface{}{
 		"chat_id":    chatID,
 		"text":       text,
@@ -422,8 +423,12 @@ func (m *MessageSender) sendBotAPIMessage(ctx context.Context, botToken string, 
 	if replyToID != 0 {
 		payload["reply_to_message_id"] = replyToID
 	}
-	if btn != nil {
-		payload["reply_markup"] = json.RawMessage(btn.BuildBotAPIKeyboard(cols))
+	if markup != nil {
+		keyboard, err := buildBotAPIKeyboard(markup)
+		if err != nil {
+			return 0, err
+		}
+		payload["reply_markup"] = keyboard
 	}
 
 	body, err := json.Marshal(payload)
@@ -457,6 +462,39 @@ func (m *MessageSender) sendBotAPIMessage(ctx context.Context, botToken string, 
 		return 0, fmt.Errorf("bot api error: %s", res.Description)
 	}
 	return res.Result.MessageID, nil
+}
+
+func buildBotAPIKeyboard(markup tg.ReplyMarkupClass) (json.RawMessage, error) {
+	inline, ok := markup.(*tg.ReplyInlineMarkup)
+	if !ok {
+		return nil, fmt.Errorf("unsupported reply markup type %T", markup)
+	}
+
+	rows := make([][]map[string]string, 0, len(inline.Rows))
+	for _, row := range inline.Rows {
+		buttons := make([]map[string]string, 0, len(row.Buttons))
+		for _, button := range row.Buttons {
+			item := map[string]string{"text": button.Text}
+			switch buttonType := button.Type.(type) {
+			case *tg.InlineButtonTypeURL:
+				item["url"] = buttonType.URL
+			case *tg.InlineButtonTypeCallback:
+				item["callback_data"] = string(buttonType.Data)
+			default:
+				return nil, fmt.Errorf("unsupported inline button type %T", button.Type)
+			}
+			buttons = append(buttons, item)
+		}
+		if len(buttons) > 0 {
+			rows = append(rows, buttons)
+		}
+	}
+
+	data, err := json.Marshal(map[string]interface{}{"inline_keyboard": rows})
+	if err != nil {
+		return nil, err
+	}
+	return data, nil
 }
 
 func (m *MessageSender) editBotAPIMessage(ctx context.Context, botToken string, chatID int64, msgID int, text string, btn *ButtonMaker, cols int) error {
