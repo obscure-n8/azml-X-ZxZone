@@ -47,8 +47,8 @@ Deploys `AZML-Go` using Heroku's **Container Stack** where Heroku builds the `Do
 
 #### 2. Clone the Repository
 ```bash
-git clone https://github.com/aquib4040/azml-go.git
-cd azml-go
+git clone https://github.com/obscure-n8/azml-X-ZxZone.git
+cd azml-X-ZxZone
 ```
 
 #### 3. Log In to Heroku
